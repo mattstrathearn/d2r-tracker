@@ -6,7 +6,18 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[],
-    hiddenimports=[],
+    # The screen-reading deps are imported inside try/except blocks, so name
+    # them explicitly rather than relying on PyInstaller's static analysis.
+    hiddenimports=[
+        'd2r_vision',
+        'd2r_autodetect',
+        'mss',
+        'numpy',
+        'PIL',
+        'pytesseract',
+        'rapidfuzz',
+        'keyboard',
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

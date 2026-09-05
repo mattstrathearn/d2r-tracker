@@ -1,0 +1,19 @@
+# Core app needs only the standard library (tkinter, sqlite3).
+# Everything below is optional - the tracker runs without it, just with the
+# matching feature disabled.
+
+# Global hotkeys (Alt+1..Alt+4 while D2R has focus)
+keyboard>=0.13.5
+
+# Screen reading: auto run detection + item capture under the cursor
+mss>=9.0.1
+numpy>=1.24
+Pillow>=10.0
+pytesseract>=0.3.10
+rapidfuzz>=3.6
+
+# pytesseract is only a wrapper - it also needs the Tesseract binary itself:
+#   Windows: https://github.com/UB-Mannheim/tesseract/wiki
+#   Debian/Ubuntu: sudo apt install tesseract-ocr
+# If it isn't on PATH, point the tracker at it with the "Locate..." button in
+# the Auto-Detect settings window.

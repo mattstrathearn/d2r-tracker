@@ -22,6 +22,47 @@ try:
 except ImportError:
     GLOBAL_HOTKEYS = False
 
+try:
+    import d2r_vision as vision
+    import d2r_autodetect
+    VISION_MODULE = True
+except ImportError:
+    vision = None
+    d2r_autodetect = None
+    VISION_MODULE = False
+
+DIFFICULTIES = ["Hell", "NM", "Normal"]
+
+# Screen-reading defaults. Regions stay None until the user calibrates them;
+# everything else is tuned for 1920x1080 and adjustable from the Auto-Detect
+# settings window.
+DEFAULT_AUTO_SETTINGS = {
+    "enabled": False,
+    "difficulty": "Hell",
+    "loading_region": None,
+    "area_region": None,
+    "dark_threshold": 22,
+    "dark_samples": 2,
+    "poll_interval": 0.25,
+    "area_poll_interval": 1.5,
+    "area_settle_delay": 0.6,
+    "area_tolerance": 90,
+    "area_min_score": 80,
+    "area_miss_limit": 3,
+    "fallback_without_area": True,
+    "stop_in_town": True,
+    "restart_on_area_change": False,
+    "min_run_seconds": 3.0,
+    "tooltip_width": 460,
+    "tooltip_height": 130,
+    "tooltip_offset_x": 0,
+    "tooltip_offset_y": 0,
+    "tooltip_tolerance": 60,
+    "item_min_score": 75,
+    "capture_qualities": ["unique", "set", "rune"],
+    "tesseract_path": "",
+}
+
 RUN_TYPES = [
     "Hell - Countess",
     "Hell - The Pit",
@@ -1331,7 +1372,30 @@ class D2RMFTracker:
         self._recent_run_map = {}
         self._hotkey_handles = []
 
+        self.auto_settings = self._load_auto_settings()
+        self.auto_enabled = tk.BooleanVar(value=bool(self.auto_settings.get("enabled")))
+        self.detector = None
+        self._auto_status = "Auto-detect off"
+        self._item_index = vision.build_item_index(D2R_ITEMS) if VISION_MODULE else {}
+        if VISION_MODULE:
+            vision.set_tesseract_path(self.auto_settings.get("tesseract_path"))
+
         self._build_setup_screen()
+
+    # ------------------------------------------------------------------
+    # Auto-detect settings
+    # ------------------------------------------------------------------
+    def _load_auto_settings(self):
+        stored = self.app_config.get("auto_detect")
+        settings = dict(DEFAULT_AUTO_SETTINGS)
+        if isinstance(stored, dict):
+            settings.update(stored)
+        return settings
+
+    def _save_auto_settings(self):
+        self.auto_settings["enabled"] = bool(self.auto_enabled.get())
+        self.app_config["auto_detect"] = self.auto_settings
+        self._save_config()
 
     def _load_config(self):
         try:
@@ -1830,7 +1894,7 @@ class D2RMFTracker:
         self.item_entry.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 2))
         self.lbl_item_help = tk.Label(
             self.sec_items,
-            text="Type item name + Enter  │  Alt+2 focus item entry",
+            text="Type item name + Enter  │  Alt+2 focus entry  │  Alt+4 capture item under cursor",
             font=("Segoe UI", 10),
             fg="#666688",
             bg=self.BG,
@@ -1912,16 +1976,24 @@ class D2RMFTracker:
             pady=2,
         ).grid(row=1, column=0, pady=(0, 8))
 
+        self._build_auto_detect_bar(main)
         self._build_mini_hud()
 
         self.root.bind_all("<Alt-Key-1>", lambda e: self._toggle_run())
         self.root.bind_all("<Alt-Key-2>", lambda e: self.item_entry.focus_input())
         self.root.bind_all("<Alt-Key-3>", lambda e: self._show_stats())
+        self.root.bind_all("<Alt-Key-4>", lambda e: self._capture_item_at_cursor())
 
         if GLOBAL_HOTKEYS:
             self._hotkey_handles.append(kb.add_hotkey("alt+1", lambda: self.root.after(0, self._toggle_run)))
             self._hotkey_handles.append(kb.add_hotkey("alt+2", lambda: self.root.after(0, self.item_entry.focus_input)))
             self._hotkey_handles.append(kb.add_hotkey("alt+3", lambda: self.root.after(0, self._show_stats)))
+            self._hotkey_handles.append(kb.add_hotkey("alt+4", lambda: self.root.after(0, self._capture_item_at_cursor)))
+
+        if self.auto_enabled.get():
+            # Give the overlay a moment to finish laying out before the watcher
+            # thread starts pushing status updates into it.
+            self.root.after(500, self._toggle_auto_detect_on_launch)
 
         self._configure_overlay_window()
         self._apply_recent_runs_visibility()
@@ -1929,6 +2001,51 @@ class D2RMFTracker:
         self._sync_run_controls()
         self.root.after(50, self._update_content_scrollbar)
         self._tick()
+
+    def _build_auto_detect_bar(self, parent):
+        """Compact auto-detect toggle, status line, and settings entry point."""
+        bar = tk.Frame(parent, bg="#12122a", bd=1, relief="flat")
+        bar.grid(row=5, column=0, sticky="ew", pady=(4, 2))
+        bar.grid_columnconfigure(1, weight=1)
+
+        tk.Checkbutton(
+            bar,
+            text="Auto-detect runs",
+            variable=self.auto_enabled,
+            command=self._toggle_auto_detect,
+            bg="#12122a",
+            fg=self.FG,
+            activebackground="#12122a",
+            activeforeground=self.FG,
+            selectcolor="#2a2a3a",
+            font=("Segoe UI", 10, "bold"),
+        ).grid(row=0, column=0, sticky="w", padx=(8, 4), pady=4)
+
+        tk.Button(
+            bar,
+            text="⚙  Calibrate…",
+            command=self._show_auto_settings,
+            font=("Segoe UI", 9),
+            bg="#2a2a4a",
+            fg=self.FG,
+            relief="flat",
+            padx=8,
+        ).grid(row=0, column=2, sticky="e", padx=(4, 8), pady=4)
+
+        self.lbl_auto_status = tk.Label(
+            bar,
+            text=f"👁  {self._auto_status}",
+            font=("Segoe UI", 9),
+            fg=self.PURPLE,
+            bg="#12122a",
+            anchor="w",
+        )
+        self.lbl_auto_status.grid(row=1, column=0, columnspan=3, sticky="ew", padx=8, pady=(0, 5))
+
+    def _toggle_auto_detect_on_launch(self):
+        """Restore the saved auto-detect state once the overlay is up."""
+        if not self._start_detector():
+            self.auto_enabled.set(False)
 
     def _build_mini_hud(self):
         self.mini_hud = tk.Frame(self.root, bg="#101626", bd=1, relief="solid")
@@ -2208,6 +2325,299 @@ class D2RMFTracker:
             font=("Segoe UI", 11),
         ).pack(anchor="w", pady=(4, 0))
 
+    # ------------------------------------------------------------------
+    # Auto-detect: calibration window
+    # ------------------------------------------------------------------
+    def _pick_region(self, title, on_done, on_cancel=None):
+        """Full-screen drag-a-box selector. Returns screen coordinates."""
+        picker = tk.Toplevel(self.root)
+        picker.attributes("-fullscreen", True)
+        picker.attributes("-topmost", True)
+        picker.attributes("-alpha", 0.30)
+        picker.configure(bg="#000000", cursor="crosshair")
+
+        canvas = tk.Canvas(picker, bg="#000000", highlightthickness=0)
+        canvas.pack(fill=tk.BOTH, expand=True)
+        canvas.create_text(
+            picker.winfo_screenwidth() // 2,
+            40,
+            text=f"{title}  -  drag a box, or press Esc to cancel",
+            fill="#ffd700",
+            font=("Segoe UI", 16, "bold"),
+        )
+
+        state = {"x": 0, "y": 0, "rect": None, "done": False}
+
+        def finish(box):
+            if state["done"]:
+                return
+            state["done"] = True
+            picker.destroy()
+            if box:
+                on_done(box)
+            elif on_cancel:
+                on_cancel()
+
+        def on_press(event):
+            state["x"], state["y"] = event.x, event.y
+            if state["rect"]:
+                canvas.delete(state["rect"])
+            state["rect"] = canvas.create_rectangle(
+                event.x, event.y, event.x, event.y, outline="#ffd700", width=2
+            )
+
+        def on_drag(event):
+            if state["rect"]:
+                canvas.coords(state["rect"], state["x"], state["y"], event.x, event.y)
+
+        def on_release(event):
+            left, top = min(state["x"], event.x), min(state["y"], event.y)
+            width, height = abs(event.x - state["x"]), abs(event.y - state["y"])
+            if width > 4 and height > 4:
+                finish({"left": left, "top": top, "width": width, "height": height})
+            else:
+                finish(None)
+
+        canvas.bind("<ButtonPress-1>", on_press)
+        canvas.bind("<B1-Motion>", on_drag)
+        canvas.bind("<ButtonRelease-1>", on_release)
+        picker.bind("<Escape>", lambda e: finish(None))
+        picker.protocol("WM_DELETE_WINDOW", lambda: finish(None))
+        picker.focus_force()
+
+    def _show_auto_settings(self):
+        win = tk.Toplevel(self.root)
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        win.configure(bg=self.BG)
+        x = self.root.winfo_x() + 40
+        y = self.root.winfo_y() + 60
+        win.geometry(f"430x560+{x}+{y}")
+
+        top = tk.Frame(win, bg="#12122a")
+        top.pack(fill=tk.X)
+        tk.Label(
+            top, text="Auto-Detect Settings", font=("Segoe UI", 11, "bold"),
+            fg=self.GOLD, bg="#12122a", padx=8, pady=6,
+        ).pack(side=tk.LEFT)
+        tk.Button(
+            top, text="✕", command=win.destroy, font=("Segoe UI", 10),
+            bg="#5a1a1a", fg=self.FG, relief="flat",
+        ).pack(side=tk.RIGHT, padx=6, pady=4)
+        top.bind("<Button-1>", lambda e: self._drag_child_start(e, win))
+        top.bind("<B1-Motion>", lambda e: self._drag_child_move(e, win))
+
+        body = tk.Frame(win, bg=self.BG, padx=12, pady=10)
+        body.pack(fill=tk.BOTH, expand=True)
+
+        # -- dependency / tesseract status --------------------------------
+        if not VISION_MODULE:
+            dep_text = "Screen-reading modules not found"
+        elif vision.MISSING_DEPS:
+            dep_text = "Missing: " + ", ".join(vision.MISSING_DEPS)
+        elif not vision.tesseract_available():
+            dep_text = "Tesseract binary not found"
+        else:
+            dep_text = "All dependencies OK"
+        dep_row = tk.Frame(body, bg=self.BG)
+        dep_row.pack(fill=tk.X, pady=(0, 8))
+        lbl_dep = tk.Label(
+            dep_row, text=dep_text, font=("Segoe UI", 10),
+            fg=self.GREEN if dep_text.endswith("OK") else self.ORANGE, bg=self.BG,
+        )
+        lbl_dep.pack(side=tk.LEFT)
+
+        def locate_tesseract():
+            path = filedialog.askopenfilename(
+                title="Locate tesseract.exe",
+                filetypes=[("Tesseract", "tesseract.exe"), ("All Files", "*.*")],
+            )
+            if not path:
+                return
+            self.auto_settings["tesseract_path"] = path
+            self._save_auto_settings()
+            vision.set_tesseract_path(path)
+            if vision.tesseract_available():
+                lbl_dep.config(text="All dependencies OK", fg=self.GREEN)
+            else:
+                lbl_dep.config(text="That file did not work as Tesseract", fg=self.ORANGE)
+
+        if VISION_MODULE and not vision.MISSING_DEPS and not vision.tesseract_available():
+            tk.Button(
+                dep_row, text="Locate…", command=locate_tesseract, font=("Segoe UI", 9),
+                bg="#2a2a4a", fg=self.FG, relief="flat", padx=8,
+            ).pack(side=tk.RIGHT)
+
+        # -- region calibration -------------------------------------------
+        region_labels = {}
+
+        def region_text(key):
+            box = vision.normalize_region(self.auto_settings.get(key)) if VISION_MODULE else None
+            if not box:
+                return "not set"
+            return f"{box['width']}x{box['height']} at {box['left']},{box['top']}"
+
+        def make_region_row(parent, key, label, hint):
+            row = tk.Frame(parent, bg=self.BG)
+            row.pack(fill=tk.X, pady=(6, 0))
+            tk.Label(
+                row, text=label, font=("Segoe UI", 11, "bold"), fg=self.FG, bg=self.BG
+            ).pack(anchor="w")
+            tk.Label(
+                row, text=hint, font=("Segoe UI", 9), fg="#666688", bg=self.BG,
+                wraplength=390, justify="left",
+            ).pack(anchor="w")
+            sub = tk.Frame(row, bg=self.BG)
+            sub.pack(fill=tk.X, pady=(2, 0))
+            value = tk.Label(
+                sub, text=region_text(key), font=("Segoe UI", 10), fg=self.PURPLE, bg=self.BG
+            )
+            value.pack(side=tk.LEFT)
+            region_labels[key] = value
+
+            def do_pick():
+                # Hide our own windows so they cannot be picked by mistake.
+                win.withdraw()
+                self.root.withdraw()
+
+                def restore():
+                    self.root.deiconify()
+                    win.deiconify()
+
+                def done(box):
+                    self.auto_settings[key] = box
+                    self._save_auto_settings()
+                    if self.detector:
+                        self.detector.update_settings(self.auto_settings)
+                    restore()
+                    value.config(text=region_text(key))
+
+                self.root.after(250, lambda: self._pick_region(label, done, restore))
+
+            tk.Button(
+                sub, text="Set…", command=do_pick, font=("Segoe UI", 9),
+                bg="#2a2a4a", fg=self.FG, relief="flat", padx=8,
+            ).pack(side=tk.RIGHT)
+
+        make_region_row(
+            body, "loading_region", "Loading-screen probe",
+            "A small box in an area that is bright in game and black during a "
+            "loading screen. The middle of the screen works well.",
+        )
+        make_region_row(
+            body, "area_region", "Automap area name",
+            "The area name the automap prints at the top of the screen. Leave "
+            "unset to time runs purely off loading screens.",
+        )
+
+        # -- difficulty ----------------------------------------------------
+        tk.Label(
+            body, text="Difficulty", font=("Segoe UI", 11, "bold"), fg=self.FG, bg=self.BG
+        ).pack(anchor="w", pady=(12, 0))
+        tk.Label(
+            body, text="The area name does not include difficulty, so pick it here.",
+            font=("Segoe UI", 9), fg="#666688", bg=self.BG,
+        ).pack(anchor="w")
+        diff_var = tk.StringVar(value=self.auto_settings.get("difficulty", "Hell"))
+
+        def on_diff(*_):
+            self.auto_settings["difficulty"] = diff_var.get()
+            self._save_auto_settings()
+            if self.detector:
+                self.detector.update_settings(self.auto_settings)
+
+        diff_var.trace_add("write", on_diff)
+        ttk.Combobox(
+            body, textvariable=diff_var, values=DIFFICULTIES, state="readonly", width=12
+        ).pack(anchor="w", pady=(2, 0))
+
+        # -- tuning knobs --------------------------------------------------
+        def make_scale(label, key, lo, hi, resolution, hint=""):
+            tk.Label(
+                body, text=label, font=("Segoe UI", 11, "bold"), fg=self.FG, bg=self.BG
+            ).pack(anchor="w", pady=(10, 0))
+            if hint:
+                tk.Label(
+                    body, text=hint, font=("Segoe UI", 9), fg="#666688", bg=self.BG,
+                    wraplength=390, justify="left",
+                ).pack(anchor="w")
+            var = tk.DoubleVar(value=float(self.auto_settings.get(key, lo)))
+
+            def on_change(_value=None):
+                self.auto_settings[key] = var.get()
+                self._save_auto_settings()
+                if self.detector:
+                    self.detector.update_settings(self.auto_settings)
+
+            tk.Scale(
+                body, from_=lo, to=hi, resolution=resolution, orient="horizontal",
+                variable=var, command=on_change, bg=self.BG, fg=self.FG,
+                highlightthickness=0, troughcolor="#2a2a3a",
+            ).pack(fill=tk.X)
+
+        make_scale(
+            "Loading-screen darkness", "dark_threshold", 5, 80, 1,
+            "Raise this if loading screens are missed, lower it if dark areas "
+            "false-trigger a run.",
+        )
+        make_scale(
+            "Tooltip capture height", "tooltip_height", 60, 400, 10,
+            "How tall a box to grab above the cursor when capturing an item.",
+        )
+        make_scale(
+            "Tooltip capture width", "tooltip_width", 150, 900, 10,
+        )
+
+        # -- toggles -------------------------------------------------------
+        def make_check(label, key):
+            var = tk.BooleanVar(value=bool(self.auto_settings.get(key)))
+
+            def on_toggle():
+                self.auto_settings[key] = bool(var.get())
+                self._save_auto_settings()
+                if self.detector:
+                    self.detector.update_settings(self.auto_settings)
+
+            tk.Checkbutton(
+                body, text=label, variable=var, command=on_toggle, bg=self.BG, fg=self.FG,
+                activebackground=self.BG, activeforeground=self.FG, selectcolor="#2a2a3a",
+                font=("Segoe UI", 10),
+            ).pack(anchor="w", pady=(6, 0))
+
+        make_check("Stop the run when entering town", "stop_in_town")
+        make_check("Fall back to loading screens if no area is read", "fallback_without_area")
+
+        # -- test button ---------------------------------------------------
+        result = tk.Label(
+            body, text="", font=("Segoe UI", 10), fg=self.PURPLE, bg=self.BG,
+            wraplength=390, justify="left",
+        )
+
+        def test_area():
+            if not VISION_MODULE or not vision.VISION_AVAILABLE:
+                result.config(text="Screen-reading modules unavailable")
+                return
+            frame = vision.grab(self.auto_settings.get("area_region"))
+            if frame is None:
+                result.config(text="Set the area-name region first")
+                return
+            masked = vision.mask_colors(
+                frame, [vision.AREA_NAME_COLOR],
+                tolerance=int(self.auto_settings.get("area_tolerance", 90)),
+            )
+            text = vision.ocr(masked, single_line=True)
+            area, suffix = vision.match_area(text)
+            if area:
+                result.config(text=f"Read '{text}' → {area.title()} → {suffix or 'not a run area'}")
+            else:
+                result.config(text=f"Read '{text}' → no area matched")
+
+        tk.Button(
+            body, text="🔍  Test area-name OCR", command=test_area, font=("Segoe UI", 10),
+            bg="#2a2a4a", fg=self.FG, relief="flat", padx=8, pady=3,
+        ).pack(anchor="w", pady=(12, 4))
+        result.pack(anchor="w")
+
     def _set_window_alpha(self, _value=None):
         self.root.attributes("-alpha", max(0.45, min(1.0, self.overlay_alpha.get())))
 
@@ -2329,6 +2739,94 @@ class D2RMFTracker:
         self._set_window_size(width=self.normal_width, height=self.normal_height, min_width=self.min_normal_width, keep_top=True)
         self.root.after(10, self._update_content_scrollbar)
 
+    # ------------------------------------------------------------------
+    # Auto-detect: lifecycle and callbacks
+    # ------------------------------------------------------------------
+    def _toggle_auto_detect(self):
+        if self.auto_enabled.get():
+            if not self._start_detector():
+                self.auto_enabled.set(False)
+        else:
+            self._stop_detector()
+        self._save_auto_settings()
+
+    def _start_detector(self):
+        if not VISION_MODULE:
+            self._set_auto_status("Auto-detect needs the screen-reading modules")
+            return False
+        if not vision.VISION_AVAILABLE:
+            self._set_auto_status("Missing: " + ", ".join(vision.MISSING_DEPS))
+            return False
+        if not vision.tesseract_available():
+            self._set_auto_status("Tesseract not found - set its path in Auto-Detect settings")
+            return False
+
+        if self.detector is None:
+            self.detector = d2r_autodetect.RunDetector(
+                self.auto_settings,
+                RUN_TYPES,
+                on_run_start=self._auto_run_start,
+                on_run_end=self._auto_run_end,
+                on_status=self._auto_status_cb,
+            )
+        else:
+            self.detector.update_settings(self.auto_settings)
+            if self.detector.running:
+                return True
+        return self.detector.start()
+
+    def _stop_detector(self):
+        if self.detector is not None:
+            self.detector.stop()
+        self._set_auto_status("Auto-detect off")
+
+    # These three are called from the detector thread, so they only schedule
+    # work onto the Tk main loop - same pattern as the global hotkeys.
+    def _auto_run_start(self, run_type):
+        self.root.after(0, lambda: self._apply_auto_run_start(run_type))
+
+    def _auto_run_end(self):
+        self.root.after(0, self._apply_auto_run_end)
+
+    def _auto_status_cb(self, message):
+        self.root.after(0, lambda: self._set_auto_status(message))
+
+    def _apply_auto_run_start(self, run_type):
+        if not self.session_running or self.run_running:
+            return
+        if run_type and run_type in RUN_TYPES:
+            self.run_type_var.set(run_type)
+        self._toggle_run(from_detector=True)
+
+    def _apply_auto_run_end(self):
+        if self.run_running:
+            self._toggle_run(from_detector=True)
+
+    def _set_auto_status(self, message):
+        self._auto_status = message
+        if hasattr(self, "lbl_auto_status"):
+            self.lbl_auto_status.config(text=f"👁  {message}")
+
+    # ------------------------------------------------------------------
+    # Auto-detect: item capture under the cursor
+    # ------------------------------------------------------------------
+    def _capture_item_at_cursor(self):
+        if not VISION_MODULE or not vision.VISION_AVAILABLE:
+            self._set_auto_status("Item capture needs the screen-reading modules")
+            return
+        if not self._active_run_id():
+            self._set_auto_status("No run to add an item to")
+            return
+
+        name, score, debug = d2r_autodetect.capture_item_at_cursor(
+            self.auto_settings, self._item_index
+        )
+        if name:
+            self._add_item(name)
+            self._set_auto_status(f"Captured: {vision.strip_suffix(name)} ({score:.0f}%)")
+        else:
+            self._set_auto_status(f"No match - read: {debug[:60]}")
+
     def _toggle_session(self):
         if not self.session_running:
             self.session_id = self.db.start_session(self.character_name)
@@ -2359,9 +2857,17 @@ class D2RMFTracker:
             self.lbl_run_type_active.config(text="")
             self.current_run_id = None
 
-    def _toggle_run(self):
+    def _toggle_run(self, from_detector=False):
         if not self.session_running:
             return
+
+        # A manual start/stop has to be mirrored into the detector, or it will
+        # keep waiting for an edge that already happened.
+        if not from_detector and self.detector is not None and self.detector.running:
+            if self.run_running:
+                self.detector.notify_run_stopped_externally()
+            else:
+                self.detector.notify_run_started_externally()
 
         if not self.run_running:
             run_type = self.run_type_var.get()
@@ -2634,6 +3140,8 @@ class D2RMFTracker:
         self.root.mainloop()
 
     def _on_close(self):
+        if self.detector is not None:
+            self.detector.stop()
         if self.run_running:
             self._toggle_run()
         if self.session_running and self.db and self.session_id:
